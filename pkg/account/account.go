@@ -79,7 +79,7 @@ type oauthPayload struct {
 var domainRegEx = regexp.MustCompile(`^[A-Za-z0-9-.]+$`) // We're mostly interested in stopping paths; the http package handles the rest.
 var remappedDomains = map[string]string{}                // For use during development; populate in an init() function.
 
-const defaultDomain = "fleet-api.prd.na.vn.cloud.tesla.com"
+const defaultDomain = "fleet-api.prd.eu.vn.cloud.tesla.com"
 
 func (p *oauthPayload) domain() string {
 	if len(remappedDomains) > 0 {
@@ -87,6 +87,13 @@ func (p *oauthPayload) domain() string {
 			if d, ok := remappedDomains[a]; ok {
 				return d
 			}
+		}
+	}
+	// PATCHED by jbanyer, always return the EU domain if present, to handle
+	// tokens with an incorrect ou_code
+	for _, u := range p.Audiences {
+		if strings.Contains(u, defaultDomain) {
+			return defaultDomain
 		}
 	}
 	domain := defaultDomain
@@ -129,6 +136,7 @@ func New(oauthToken, userAgent string) (*Account, error) {
 	}
 
 	domain := payload.domain()
+	log.Debug("Account.New using domain %s", domain)
 	if domain == "" {
 		return nil, fmt.Errorf("client provided OAuth token with invalid audiences")
 	}
