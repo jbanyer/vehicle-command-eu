@@ -21,7 +21,7 @@ import (
 // MaxLatency is the default maximum latency permitted when updating the vehicle clock estimate.
 var MaxLatency = 10 * time.Second
 
-func readWithContext(ctx context.Context, r io.Reader, p []byte) ([]byte, error) {
+func ReadWithContext(ctx context.Context, r io.Reader, p []byte) ([]byte, error) {
 	bytesRead := 0
 	for {
 		if ctx.Err() != nil {
@@ -48,7 +48,7 @@ The regular expression below extracts domains from HTTP bodies:
 
 	{
 	  "response": null,
-	  "error": "user out of region, use base URL: https://fleet-api.prd.na.vn.cloud.tesla.com, see https://developer.tesla.com/docs/fleet-api#regional-requirements",
+	  "error": "user out of region, use base URL: https://fleet-api.prd.na.vn.cloud.tesla.com, see https://...",
 	  "error_description": ""
 	}
 */
@@ -108,7 +108,7 @@ func SendFleetAPICommand(ctx context.Context, client *http.Client, userAgent, au
 	defer result.Body.Close()
 
 	body = make([]byte, connector.MaxResponseLength+1)
-	body, err = readWithContext(ctx, result.Body, body)
+	body, err = ReadWithContext(ctx, result.Body, body)
 	if err != nil {
 		return nil, &protocol.CommandError{Err: err, PossibleSuccess: true, PossibleTemporary: false}
 	}

@@ -16,9 +16,31 @@ import (
 	"github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/keys"
 	"github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/vcsec"
 	"github.com/teslamotors/vehicle-command/pkg/vehicle"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-var ErrCommandLineArgs = errors.New("invalid command line arguments")
+var (
+	ErrCommandLineArgs = errors.New("invalid command line arguments")
+	ErrInvalidTime     = errors.New("invalid time")
+	dayNamesBitMask    = map[string]int32{
+		"SUN":       1,
+		"SUNDAY":    1,
+		"MON":       2,
+		"MONDAY":    2,
+		"TUES":      4,
+		"TUESDAY":   4,
+		"WED":       8,
+		"WEDNESDAY": 8,
+		"THURS":     16,
+		"THURSDAY":  16,
+		"FRI":       32,
+		"FRIDAY":    32,
+		"SAT":       64,
+		"SATURDAY":  64,
+		"ALL":       127,
+		"WEEKDAYS":  62,
+	}
+)
 
 type Argument struct {
 	name string
@@ -34,6 +56,80 @@ type Command struct {
 	args             []Argument
 	optional         []Argument
 	handler          Handler
+	domain           protocol.Domain
+}
+
+var categoriesByName = map[string]vehicle.StateCategory{
+	"charge":                vehicle.StateCategoryCharge,
+	"climate":               vehicle.StateCategoryClimate,
+	"drive":                 vehicle.StateCategoryDrive,
+	"location":              vehicle.StateCategoryLocation,
+	"closures":              vehicle.StateCategoryClosures,
+	"charge-schedule":       vehicle.StateCategoryChargeSchedule,
+	"precondition-schedule": vehicle.StateCategoryPreconditioningSchedule,
+	"tire-pressure":         vehicle.StateCategoryTirePressure,
+	"media":                 vehicle.StateCategoryMedia,
+	"media-detail":          vehicle.StateCategoryMediaDetail,
+	"software-update":       vehicle.StateCategorySoftwareUpdate,
+	"parental-controls":     vehicle.StateCategoryParentalControls,
+}
+
+func categoryNames() []string {
+	var names []string
+	for name, _ := range categoriesByName {
+		names = append(names, name)
+	}
+	return names
+}
+
+func GetCategory(nameStr string) (vehicle.StateCategory, error) {
+	if category, ok := categoriesByName[strings.ToLower(nameStr)]; ok {
+		return category, nil
+	}
+	return 0, fmt.Errorf("unrecognized state category '%s'", nameStr)
+}
+
+func GetDegree(degStr string) (float32, error) {
+	deg, err := strconv.ParseFloat(degStr, 32)
+	if err != nil {
+		return 0.0, err
+	}
+	if deg < -180 || deg > 180 {
+		return 0.0, errors.New("latitude and longitude must both be in the range [-180, 180]")
+	}
+	return float32(deg), nil
+}
+
+func GetDays(days string) (int32, error) {
+	var mask int32
+	for _, d := range strings.Split(days, ",") {
+		if v, ok := dayNamesBitMask[strings.TrimSpace(strings.ToUpper(d))]; ok {
+			mask |= v
+		} else {
+			return 0, fmt.Errorf("unrecognized day name: %v", d)
+		}
+	}
+	return mask, nil
+}
+
+func MinutesAfterMidnight(hoursAndMinutes string) (int32, error) {
+	components := strings.Split(hoursAndMinutes, ":")
+	if len(components) != 2 {
+		return 0, fmt.Errorf("%w: expected HH:MM", ErrInvalidTime)
+	}
+	hours, err := strconv.Atoi(components[0])
+	if err != nil {
+		return 0, fmt.Errorf("%w: %s", ErrInvalidTime, err)
+	}
+	minutes, err := strconv.Atoi(components[1])
+	if err != nil {
+		return 0, fmt.Errorf("%w: %s", ErrInvalidTime, err)
+	}
+
+	if hours > 23 || hours < 0 || minutes > 59 || minutes < 0 {
+		return 0, fmt.Errorf("%w: hours or minutes outside valid range", ErrInvalidTime)
+	}
+	return int32(60*hours + minutes), nil
 }
 
 // configureAndVerifyFlags verifies that c contains all the information required to execute a command.
@@ -43,8 +139,22 @@ func configureFlags(c *cli.Config, commandName string, forceBLE bool) error {
 		return ErrUnknownCommand
 	}
 	c.Flags = cli.FlagBLE
-	if (forceBLE && commandName == "wake") || info.requiresAuth {
+	if info.domain != protocol.DomainNone {
+		c.Domains = cli.DomainList{info.domain}
+	}
+	bleWake := forceBLE && commandName == "wake"
+	if bleWake || info.requiresAuth {
+		// Wake commands are special. When sending a wake command over the Internet, infotainment
+		// cannot authenticate the command because it's asleep. When sending the command over BLE,
+		// VCSEC _does_ authenticate the command before poking infotainment.
 		c.Flags |= cli.FlagPrivateKey | cli.FlagVIN
+	}
+	if bleWake {
+		// Normally, clients send out two handshake messages in parallel in order to reduce latency.
+		// One handshake with VCSEC, one handshake with infotainment. However, if we're sending a
+		// BLE wake command, then infotainment is (presumably) asleep, and so we should only try to
+		// handshake with VCSEC.
+		c.Domains = cli.DomainList{protocol.DomainVCSEC}
 	}
 	if !info.requiresFleetAPI {
 		c.Flags |= cli.FlagVIN
@@ -163,6 +273,25 @@ func (c *Command) Usage(name string) {
 }
 
 var commands = map[string]*Command{
+	"valet-mode-on": &Command{
+		help:             "Enable valet mode",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "PIN", help: "Valet mode PIN"},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			return car.EnableValetMode(ctx, args["PIN"])
+		},
+	},
+	"valet-mode-off": &Command{
+		help:             "Disable valet mode",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			return car.DisableValetMode(ctx)
+		},
+	},
 	"unlock": &Command{
 		help:             "Unlock vehicle",
 		requiresAuth:     true,
@@ -639,7 +768,7 @@ var commands = map[string]*Command{
 	},
 	"session-info": &Command{
 		help:             "Retrieve session info for PUBLIC_KEY from DOMAIN",
-		requiresAuth:     true,
+		requiresAuth:     false,
 		requiresFleetAPI: false,
 		args: []Argument{
 			Argument{name: "PUBLIC_KEY", help: "file containing public key (or corresponding private key)"},
@@ -781,6 +910,279 @@ var commands = map[string]*Command{
 		requiresFleetAPI: false,
 		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
 			return car.CloseWindows(ctx)
+		},
+	},
+	"body-controller-state": &Command{
+		help:             "Fetch limited vehicle state information. Works over BLE when infotainment is asleep.",
+		domain:           protocol.DomainVCSEC,
+		requiresAuth:     false,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			info, err := car.BodyControllerState(ctx)
+			if err != nil {
+				return err
+			}
+			options := protojson.MarshalOptions{
+				Indent:            "\t",
+				UseEnumNumbers:    false,
+				EmitUnpopulated:   false,
+				EmitDefaultValues: true,
+			}
+			fmt.Println(options.Format(info))
+			return nil
+		},
+	},
+	"guest-mode-on": &Command{
+		help:             "Enable Guest Mode. See https://developer.tesla.com/docs/fleet-api/endpoints/vehicle-commands#guest-mode.",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			return car.SetGuestMode(ctx, true)
+		},
+	},
+	"guest-mode-off": &Command{
+		help:             "Disable Guest Mode.",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			return car.SetGuestMode(ctx, false)
+		},
+	},
+	"erase-guest-data": &Command{
+		help:             "Erase Guest Mode user data",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			return car.EraseGuestData(ctx)
+		},
+	},
+	"charging-schedule-add": &Command{
+		help:             "Schedule charge for DAYS START_TIME-END_TIME at LATITUDE LONGITUDE. The END_TIME may be on the following day.",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "DAYS", help: "Comma-separated list of any of Sun, Mon, Tues, Wed, Thurs, Fri, Sat OR all OR weekdays"},
+			Argument{name: "TIME", help: "Time interval to charge (24-hour clock). Examples: '22:00-6:00', '-6:00', '20:32-"},
+			Argument{name: "LATITUDE", help: "Latitude of charging site"},
+			Argument{name: "LONGITUDE", help: "Longitude of charging site"},
+		},
+		optional: []Argument{
+			Argument{name: "REPEAT", help: "Set to 'once' or omit to repeat weekly"},
+			Argument{name: "ID", help: "The ID of the charge schedule to modify. Not required for new schedules."},
+			Argument{name: "ENABLED", help: "Whether the charge schedule is enabled. Expects 'true' or 'false'. Defaults to true."},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			var err error
+			schedule := vehicle.ChargeSchedule{
+				Id:      uint64(time.Now().Unix()),
+				Enabled: true,
+			}
+
+			if enabledStr, ok := args["ENABLED"]; ok {
+				schedule.Enabled = enabledStr == "true"
+			}
+
+			schedule.DaysOfWeek, err = GetDays(args["DAYS"])
+			if err != nil {
+				return err
+			}
+
+			r := strings.Split(args["TIME"], "-")
+			if len(r) != 2 {
+				return errors.New("invalid time range")
+			}
+
+			if r[0] != "" {
+				schedule.StartTime, err = MinutesAfterMidnight(r[0])
+				schedule.StartEnabled = true
+				if err != nil {
+					return err
+				}
+			}
+
+			if r[1] != "" {
+				schedule.EndTime, err = MinutesAfterMidnight(r[1])
+				schedule.EndEnabled = true
+				if err != nil {
+					return err
+				}
+			}
+
+			schedule.Latitude, err = GetDegree(args["LATITUDE"])
+			if err != nil {
+				return err
+			}
+
+			schedule.Longitude, err = GetDegree(args["LONGITUDE"])
+			if err != nil {
+				return err
+			}
+
+			if repeatPolicy, ok := args["REPEAT"]; ok && repeatPolicy == "once" {
+				schedule.OneTime = true
+			}
+
+			if err := car.AddChargeSchedule(ctx, &schedule); err != nil {
+				return err
+			}
+			fmt.Printf("%d\n", schedule.Id)
+			return nil
+		},
+	},
+	"charging-schedule-remove": {
+		help:             "Removes charging schedule of TYPE [ID]",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "TYPE", help: "home|work|other|id"},
+		},
+		optional: []Argument{
+			Argument{name: "ID", help: "numeric ID of schedule to remove when TYPE set to id"},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			var home, work, other bool
+			switch strings.ToUpper(args["TYPE"]) {
+			case "ID":
+				if idStr, ok := args["ID"]; ok {
+					id, err := strconv.ParseUint(idStr, 10, 64)
+					if err != nil {
+						return errors.New("expected numeric ID")
+					}
+					return car.RemoveChargeSchedule(ctx, id)
+				} else {
+					return errors.New("missing schedule ID")
+				}
+			case "HOME":
+				home = true
+			case "WORK":
+				work = true
+			case "OTHER":
+				other = true
+			default:
+				return errors.New("TYPE must be home|work|other|id")
+			}
+			return car.BatchRemoveChargeSchedules(ctx, home, work, other)
+		},
+	},
+	"precondition-schedule-add": &Command{
+		help:             "Schedule precondition for DAYS TIME at LATITUDE LONGITUDE.",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "DAYS", help: "Comma-separated list of any of Sun, Mon, Tues, Wed, Thurs, Fri, Sat OR all OR weekdays"},
+			Argument{name: "TIME", help: "Time to precondition by. Example: '22:00'"},
+			Argument{name: "LATITUDE", help: "Latitude of location to precondition at."},
+			Argument{name: "LONGITUDE", help: "Longitude of location to precondition at."},
+		},
+		optional: []Argument{
+			Argument{name: "REPEAT", help: "Set to 'once' or omit to repeat weekly"},
+			Argument{name: "ID", help: "The ID of the precondition schedule to modify. Not required for new schedules."},
+			Argument{name: "ENABLED", help: "Whether the precondition schedule is enabled. Expects 'true' or 'false'. Defaults to true."},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			var err error
+			schedule := vehicle.PreconditionSchedule{
+				Id:      uint64(time.Now().Unix()),
+				Enabled: true,
+			}
+
+			if enabledStr, ok := args["ENABLED"]; ok {
+				schedule.Enabled = enabledStr == "true"
+			}
+
+			if idStr, ok := args["ID"]; ok {
+				id, err := strconv.ParseUint(idStr, 10, 64)
+				if err != nil {
+					return errors.New("expected numeric ID")
+				}
+				schedule.Id = id
+			}
+
+			schedule.DaysOfWeek, err = GetDays(args["DAYS"])
+			if err != nil {
+				return err
+			}
+
+			if timeStr, ok := args["TIME"]; ok {
+				schedule.PreconditionTime, err = MinutesAfterMidnight(timeStr)
+			} else {
+				return errors.New("expected TIME")
+			}
+
+			schedule.Latitude, err = GetDegree(args["LATITUDE"])
+			if err != nil {
+				return err
+			}
+
+			schedule.Longitude, err = GetDegree(args["LONGITUDE"])
+			if err != nil {
+				return err
+			}
+
+			if repeatPolicy, ok := args["REPEAT"]; ok && repeatPolicy == "once" {
+				schedule.OneTime = true
+			}
+
+			if err := car.AddPreconditionSchedule(ctx, &schedule); err != nil {
+				return err
+			}
+			fmt.Printf("%d\n", schedule.Id)
+			return nil
+		},
+	},
+	"precondition-schedule-remove": {
+		help:             "Removes precondition schedule of TYPE [ID]",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "TYPE", help: "home|work|other|id"},
+		},
+		optional: []Argument{
+			Argument{name: "ID", help: "numeric ID of schedule to remove when TYPE set to id"},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			var home, work, other bool
+			switch strings.ToUpper(args["TYPE"]) {
+			case "ID":
+				if idStr, ok := args["ID"]; ok {
+					id, err := strconv.ParseUint(idStr, 10, 64)
+					if err != nil {
+						return errors.New("expected numeric ID")
+					}
+					return car.RemoveChargeSchedule(ctx, id)
+				} else {
+					return errors.New("missing schedule ID")
+				}
+			case "HOME":
+				home = true
+			case "WORK":
+				work = true
+			case "OTHER":
+				other = true
+			default:
+				return errors.New("TYPE must be home|work|other|id")
+			}
+			return car.BatchRemovePreconditionSchedules(ctx, home, work, other)
+		},
+	},
+	"state": {
+		help:             "Fetch vehicle state over BLE.",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			Argument{name: "CATEGORY", help: "One of " + strings.Join(categoryNames(), ", ")},
+		},
+		handler: func(ctx context.Context, acct *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			category, err := GetCategory(args["CATEGORY"])
+			if err != nil {
+				return err
+			}
+			data, err := car.GetState(ctx, category)
+			if err != nil {
+				return err
+			}
+			fmt.Println(protojson.Format(data))
+			return nil
 		},
 	},
 }
